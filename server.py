@@ -1,552 +1,225 @@
 from flask import Flask, render_template_string, jsonify, request, session, redirect, url_for
-import sqlite3
-import os
-import json
-import functools
-import uuid
-import hmac
-import hashlib
-import base64
-import time
-import threading
-import asyncio
+import sqlite3, os, json, functools, uuid, hmac, hashlib, base64
+import threading, asyncio
 from datetime import datetime, timedelta
+import encodings.idna  # Render fix
 
-# --- CRITICAL FIX 1: PREVENT "IDNA" ENCODING CRASH ---
-# This specific import stops the Worker Timeout / LookupError on Render
-import encodings.idna 
-
-# --- IMPORT FETCHER ---
-import fetcher
+import fetcher  # DO NOT TOUCH
 
 app = Flask(__name__)
 
-# --- SECURITY CONFIGURATION ---
-app.secret_key = "TITAN_SECURE_KEY_CHANGE_THIS" 
-ADMIN_PASSWORD = "admin" 
-# THIS MUST MATCH YOUR LOCAL_GENERATOR.PY SECRET EXACTLY
-OFFLINE_SECRET = "TITAN_OFFLINE_SECRET_CODE_123" 
-MASTER_KEY = "TITAN-PERM-ADMIN" 
+# ===================== SECURITY CONFIG =====================
+app.secret_key = "TITAN_SECURE_KEY_CHANGE_THIS"
+ADMIN_PASSWORD = "admin"
+OFFLINE_SECRET = "TITAN_OFFLINE_SECRET_CODE_123"
+MASTER_KEY = "TITAN-PERM-ADMIN"
 
-# --- CRITICAL FIX 2: FORCE RENDER PERSISTENT DISK PATH ---
-# This ensures Server and Fetcher look at the EXACT same file for history
+# ===================== STORAGE PATH =====================
 if os.path.exists('/var/lib/data'):
     BASE_DIR = '/var/lib/data'
-    print("[SERVER] Using Render Persistent Disk: /var/lib/data")
 elif os.path.exists('/data'):
     BASE_DIR = '/data'
-    print("[SERVER] Using Render Persistent Disk: /data")
 else:
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-    print(f"[SERVER] Using Local Directory: {BASE_DIR}")
 
 DB_PATH = os.path.join(BASE_DIR, 'titan_db.sqlite')
 DASHBOARD_FILE = os.path.join(BASE_DIR, 'dashboard_data.json')
 
-def create_connection():
-    """Creates a connection to the SQLite database."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ===================== DATABASE =====================
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 def ensure_tables():
-    """Creates necessary database tables if they don't exist."""
-    conn = create_connection()
-    
-    # Access Keys Table (Stores Key + Device Lock)
-    conn.execute('''CREATE TABLE IF NOT EXISTS access_keys (
-                    key_code TEXT PRIMARY KEY,
-                    note TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active INTEGER DEFAULT 1,
-                    expires_at TEXT,
-                    max_devices INTEGER DEFAULT 1,
-                    bound_device_id TEXT
-                )''')
-    
-    # Active Sessions Table (Tracks Online Users)
-    conn.execute('''CREATE TABLE IF NOT EXISTS active_sessions (
-                    session_id TEXT PRIMARY KEY,
-                    key_code TEXT,
-                    last_seen TIMESTAMP,
-                    ip_address TEXT
-                )''')
-    
-    # Blacklist Table (Banned Keys)
-    conn.execute('''CREATE TABLE IF NOT EXISTS blacklisted_keys (
-                    key_code TEXT PRIMARY KEY, 
-                    reason TEXT, 
-                    banned_at TEXT
-                )''')
-    conn.commit()
-    conn.close()
+    c = db()
+    c.execute("""CREATE TABLE IF NOT EXISTS access_keys (
+        key_code TEXT PRIMARY KEY,
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT,
+        max_devices INTEGER DEFAULT 1,
+        bound_device_id TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS active_sessions (
+        session_id TEXT PRIMARY KEY,
+        key_code TEXT,
+        last_seen TIMESTAMP,
+        ip_address TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS blacklisted_keys (
+        key_code TEXT PRIMARY KEY,
+        reason TEXT,
+        banned_at TEXT
+    )""")
+    c.commit()
+    c.close()
 
-def cleanup_inactive_sessions():
-    """Removes users who haven't pinged in 5 minutes."""
-    conn = create_connection()
-    limit = datetime.now() - timedelta(minutes=5)
-    conn.execute("DELETE FROM active_sessions WHERE last_seen < ?", (limit,))
-    conn.commit()
-    conn.close()
+ensure_tables()
 
-# Run Database Setup
-try: 
-    ensure_tables()
-except Exception as e:
-    print(f"DB Setup Error: {e}")
-
-# --- BACKGROUND WORKER ---
-def start_fetcher_loop():
-    """Runs the fetcher's asyncio loop in a separate thread."""
+# ===================== FETCHER THREAD =====================
+def run_fetcher():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    try: 
-        loop.run_until_complete(fetcher.main_loop())
-    except Exception as e: 
-        print(f"Fetcher Error: {e}")
+    loop.run_until_complete(fetcher.main_loop())
 
-# Start the background thread only if this is the main process
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-    t = threading.Thread(target=start_fetcher_loop, daemon=True)
-    t.start()
+    threading.Thread(target=run_fetcher, daemon=True).start()
 
-# --- HELPER: VALIDATE OFFLINE KEY ---
-def validate_offline_key(key_string):
-    """
-    Validates a key generated by your local PC generator.
-    Returns: (True/False, DataDict or ErrorMessage)
-    """
-    if key_string == MASTER_KEY:
-        return True, {"name": "ADMIN", "expires": datetime.max, "max_devices": 999}
+# ===================== KEY VALIDATION =====================
+def validate_offline_key(key):
+    if key == MASTER_KEY:
+        return True, {"name": "ADMIN", "expires": datetime.max}
 
-    if not key_string.startswith("TITAN-"):
-        return False, "Invalid Key Format"
-    
+    if not key.startswith("TITAN-"):
+        return False, "Invalid Key"
+
     try:
-        parts = key_string.split('-')
-        if len(parts) != 3: return False, "Corrupt Key Structure"
-        
-        payload_b64 = parts[1]
-        signature = parts[2]
-        
-        # 1. Fix Base64 Padding and Decode
-        padding = len(payload_b64) % 4
-        if padding: payload_b64 += '=' * (4 - padding)
-        payload_raw = base64.urlsafe_b64decode(payload_b64).decode()
-        
-        # 2. Verify Signature (HMAC) using the same SECRET as your PC
-        calc_sig = hmac.new(OFFLINE_SECRET.encode(), payload_raw.encode(), hashlib.sha256).hexdigest()[:8].upper()
-        
-        if signature != calc_sig:
-            return False, "Fake Key (Signature Mismatch)"
-            
-        # 3. Extract Data: timestamp|max_devices|name
-        ts, max_dev, name = payload_raw.split('|')
-        
-        # 4. Check Expiration
-        expire_dt = datetime.fromtimestamp(int(ts))
-        if datetime.now() > expire_dt:
-            return False, "Key has Expired"
-            
-        return True, {
-            "name": name,
-            "expires": expire_dt,
-            "max_devices": int(max_dev)
-        }
-    except Exception as e:
-        return False, f"Key Validation Error: {e}"
-
-def get_name_from_key(key):
-    """Helper to just extract name for display."""
-    if key == MASTER_KEY: return "ADMIN"
-    try:
-        valid, data = validate_offline_key(key)
-        return data['name'] if valid else "Unknown"
-    except: return "Unknown"
+        _, payload, sig = key.split('-')
+        payload += '=' * (-len(payload) % 4)
+        raw = base64.urlsafe_b64decode(payload).decode()
+        ts, _, name = raw.split('|')
+        calc = hmac.new(OFFLINE_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()[:8].upper()
+        if calc != sig:
+            return False, "Invalid Signature"
+        if datetime.now() > datetime.fromtimestamp(int(ts)):
+            return False, "Key Expired"
+        return True, {"name": name, "expires": datetime.fromtimestamp(int(ts))}
+    except:
+        return False, "Corrupt Key"
 
 def login_required(f):
     @functools.wraps(f)
-    def wrapped(*args, **kwargs):
-        if not session.get('authenticated'): return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    return wrapped
+    def wrap(*a, **k):
+        if not session.get("auth"):
+            return redirect(url_for("login"))
+        return f(*a, **k)
+    return wrap
 
-def admin_required(f):
-    @functools.wraps(f)
-    def wrapped(*args, **kwargs):
-        if not session.get('is_admin'): return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return wrapped
-
-# --- ROUTES ---
-
-@app.route('/login', methods=['GET', 'POST'])
+# ===================== ROUTES =====================
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    error = None
-    if request.method == 'POST':
-        key_input = request.form.get('key', '').strip()
-        device_fingerprint = request.form.get('device_id', '').strip()
+    err = None
+    if request.method == "POST":
+        key = request.form.get("key")
+        dev = request.form.get("device")
+        c = db()
 
-        conn = create_connection()
-        
-        # 1. Check Blacklist
-        banned = conn.execute("SELECT * FROM blacklisted_keys WHERE key_code = ?", (key_input,)).fetchone()
-        if banned:
-            error = "ACCESS DENIED: KEY IS BANNED"
+        if c.execute("SELECT 1 FROM blacklisted_keys WHERE key_code=?", (key,)).fetchone():
+            err = "KEY BANNED"
         else:
-            # 2. Check DB for Existing Key (Already Registered)
-            db_key = conn.execute("SELECT * FROM access_keys WHERE key_code = ?", (key_input,)).fetchone()
-            
-            key_data = None
-            
-            if db_key:
-                # Key exists in DB
-                key_data = db_key
-            else:
-                # Key not in DB, validate as New Offline Key
-                is_valid, offline_data = validate_offline_key(key_input)
-                if is_valid:
-                    # Register the new key
-                    try:
-                        conn.execute("INSERT INTO access_keys (key_code, note, expires_at, bound_device_id) VALUES (?, ?, ?, ?)",
-                                     (key_input, offline_data['name'], offline_data['expires'].strftime('%Y-%m-%d %H:%M:%S'), device_fingerprint))
-                        conn.commit()
-                        # Re-fetch the newly created row
-                        key_data = conn.execute("SELECT * FROM access_keys WHERE key_code = ?", (key_input,)).fetchone()
-                    except:
-                        error = "Database Error: Registration Failed"
+            row = c.execute("SELECT * FROM access_keys WHERE key_code=?", (key,)).fetchone()
+            if not row:
+                ok, res = validate_offline_key(key)
+                if not ok:
+                    err = res
                 else:
-                    error = offline_data # Validation error message
+                    c.execute("INSERT INTO access_keys VALUES (?,?,?,?,?,?)",
+                              (key, res["name"], datetime.now(), res["expires"], 1, dev))
+                    c.commit()
+                    row = c.execute("SELECT * FROM access_keys WHERE key_code=?", (key,)).fetchone()
 
-            # 3. Final Checks (Expiration & Device Lock)
-            if key_data and not error:
-                # Expiration Check
-                try:
-                    exp_dt = datetime.strptime(key_data['expires_at'], '%Y-%m-%d %H:%M:%S')
-                    if datetime.now() > exp_dt:
-                        error = "KEY EXPIRED"
-                except: pass # Handle master key / formatting quirks
+            if row and not err:
+                session["auth"] = True
+                session["key"] = key
+                return redirect("/")
+        c.close()
 
-                # Device Lock Check
-                if not error:
-                    stored_device = key_data['bound_device_id']
-                    if stored_device and stored_device != device_fingerprint:
-                         error = "ACCESS DENIED: LOCKED TO ANOTHER DEVICE"
-                    else:
-                        # Success! Log them in.
-                        session['authenticated'] = True
-                        session['user_key'] = key_input
-                        
-                        # Update Active Sessions
-                        try:
-                            conn.execute("INSERT OR REPLACE INTO active_sessions (session_id, key_code, last_seen, ip_address) VALUES (?, ?, ?, ?)", 
-                                         (str(uuid.uuid4()), key_input, datetime.now(), request.remote_addr))
-                            conn.commit()
-                        except: pass
-                        
-                        conn.close()
-                        return redirect(url_for('index'))
+    return f"""
+    <body style="background:black;color:#0f0;display:flex;justify-content:center;align-items:center;height:100vh;font-family:monospace">
+    <form method="post">
+    <h2>TITAN ACCESS</h2>
+    <p style="color:red">{err or ''}</p>
+    <input type="hidden" name="device" id="d">
+    <input name="key" placeholder="PASTE KEY" style="padding:10px"><br><br>
+    <button>LOGIN</button>
+    </form>
+    <script>
+    let d=localStorage.getItem("dev");if(!d){{d="DEV-"+Date.now();localStorage.setItem("dev",d)}}
+    document.getElementById("d").value=d
+    </script>
+    </body>
+    """
 
-        conn.close()
-
-    # Login Page HTML
-    return f"""<body style="background:#000; color:#0f0; display:flex; justify-content:center; align-items:center; height:100vh; font-family:monospace; flex-direction:column;">
-            <h1>TITAN V700 ACCESS</h1>
-            <p style="color:red; font-weight:bold;">{error if error else ''}</p>
-            <form method="post">
-                <input type="hidden" name="device_id" id="did">
-                <input type="text" name="key" placeholder="PASTE ACCESS KEY" style="padding:10px; width:280px; text-align:center; background:#111; color:white; border:1px solid #333;">
-                <br><br>
-                <button style="padding:10px 30px; font-weight:bold; cursor:pointer; background:#00ff41; border:none;">UNLOCK SYSTEM</button>
-            </form>
-            <div style="margin-top:20px; color:#444; font-size:10px;">SECURE DEVICE ID: <span id="disp_did">...</span></div>
-            <script>
-                // Generate or Retrieve Permanent Device ID
-                let d = localStorage.getItem('titan_device_id');
-                if(!d) {{ 
-                    d = 'DEV-' + Math.random().toString(36).substr(2,9).toUpperCase() + '-' + Date.now(); 
-                    localStorage.setItem('titan_device_id', d); 
-                }}
-                document.getElementById('did').value = d;
-                document.getElementById('disp_did').innerText = d;
-            </script>
-            </body>"""
-
-@app.route('/logout')
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect("/login")
 
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    return jsonify({"status": "ok"})
+@app.route("/heartbeat", methods=["POST"])
+def hb():
+    return "ok"
 
-@app.route('/data')
+@app.route("/data")
 @login_required
 def data():
-    """Serves the dashboard data from the JSON file."""
     try:
-        if os.path.exists(DASHBOARD_FILE):
-            with open(DASHBOARD_FILE, 'r') as f: return jsonify(json.load(f))
-    except: pass
-    # Return default empty structure if file not ready
-    return jsonify({
-        "prediction": "LOADING...", 
-        "status_text": "WAITING FOR FETCHER...", 
-        "data_size": 0,
-        "history": [],
-        "stats": {"wins":0, "losses":0, "accuracy":"0%"}
-    })
+        return jsonify(json.load(open(DASHBOARD_FILE)))
+    except:
+        return jsonify({})
 
-# --- ADMIN PANEL ---
-@app.route('/admin_login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        if request.form.get('password') == ADMIN_PASSWORD:
-            session['is_admin'] = True
-            return redirect(url_for('admin_panel'))
-    return '<body style="background:#111; color:white; display:flex; justify-content:center; align-items:center; height:100vh;"><form method="post" style="text-align:center;"><input type="password" name="password" placeholder="Admin Password" style="padding:10px;"><button style="padding:10px; cursor:pointer;">Login</button></form></body>'
-
-@app.route('/admin', methods=['GET', 'POST'])
-@admin_required
-def admin_panel():
-    cleanup_inactive_sessions()
-    conn = create_connection()
-    msg = ""
-    
-    # ACTIONS
-    if request.method == 'POST':
-        if 'ban_key' in request.form:
-            b_key = request.form.get('ban_key').strip()
-            conn.execute("INSERT OR REPLACE INTO blacklisted_keys (key_code, reason, banned_at) VALUES (?, ?, ?)", (b_key, "Admin Ban", datetime.now()))
-            conn.execute("DELETE FROM active_sessions WHERE key_code = ?", (b_key,)) # Kick user
-            conn.commit()
-            msg = f"Key {b_key[:10]}... Banned"
-        elif 'reset_device' in request.form:
-            r_key = request.form.get('reset_device').strip()
-            conn.execute("UPDATE access_keys SET bound_device_id = NULL WHERE key_code = ?", (r_key,))
-            conn.commit()
-            msg = f"Device Lock Reset for {r_key[:10]}..."
-        elif 'delete_key' in request.form:
-             d_key = request.form.get('delete_key').strip()
-             conn.execute("DELETE FROM access_keys WHERE key_code = ?", (d_key,))
-             conn.commit()
-             msg = "Key Deleted from DB"
-
-    # FETCH DATA
-    active = conn.execute("SELECT * FROM active_sessions ORDER BY last_seen DESC").fetchall()
-    keys = conn.execute("SELECT * FROM access_keys ORDER BY created_at DESC").fetchall()
-    banned = conn.execute("SELECT * FROM blacklisted_keys ORDER BY banned_at DESC").fetchall()
-    conn.close()
-
-    # GENERATE HTML TABLES
-    active_rows = ""
-    for s in active:
-        k = s['key_code']
-        name = get_name_from_key(k)
-        active_rows += f"<tr><td style='color:#00ff41; font-weight:bold;'>{name}</td><td style='font-size:12px; font-family:monospace;'>{k}</td><td>{s['last_seen']}</td><td><form method='POST' style='display:inline'><input type='hidden' name='ban_key' value='{k}'><button style='background:red; color:white; border:none; padding:5px; cursor:pointer;'>BAN</button></form></td></tr>"
-
-    key_rows = ""
-    for k in keys:
-        lock_status = f"<span style='color:red'>🔒 LOCKED ({k['bound_device_id'][:10]}...)</span>" if k['bound_device_id'] else "<span style='color:green'>🔓 OPEN</span>"
-        key_rows += f"""
-        <tr>
-            <td>{get_name_from_key(k['key_code'])}</td>
-            <td style='font-size:10px; font-family:monospace;'>{k['key_code']}</td>
-            <td>{lock_status}</td>
-            <td>{k['expires_at']}</td>
-            <td>
-                <form method='POST' style='display:inline' onsubmit="return confirm('Reset Device Lock?');">
-                    <input type='hidden' name='reset_device' value='{k['key_code']}'>
-                    <button style='cursor:pointer;'>RESET ID</button>
-                </form>
-                <form method='POST' style='display:inline' onsubmit="return confirm('Ban this key?');">
-                    <input type='hidden' name='ban_key' value='{k['key_code']}'>
-                    <button style='color:red; cursor:pointer;'>BAN</button>
-                </form>
-            </td>
-        </tr>"""
-        
-    ban_rows = "".join([f"<tr><td style='font-size:10px; font-family:monospace;'>{b['key_code']}</td><td style='color:red'>BANNED</td></tr>" for b in banned])
-
-    return f"""<body style="font-family:monospace; padding:20px; background:#f4f4f4;">
-            <div style="max-width:1000px; margin:0 auto;">
-                <h1>TITAN V700 ADMIN PANEL</h1>
-                <p style="color:blue; font-weight:bold;">{msg}</p>
-                
-                <div style="background:white; padding:15px; border:1px solid #ccc; margin-bottom:20px;">
-                    <h3 style="margin-top:0; color:green;">🟢 ONLINE USERS ({len(active)})</h3>
-                    <table border="1" cellpadding="5" style="width:100%; border-collapse:collapse;">
-                        <tr style="background:#eee;"><th>User</th><th>Key</th><th>Last Seen</th><th>Action</th></tr>
-                        {active_rows if active_rows else "<tr><td colspan='4' style='text-align:center'>No users online</td></tr>"}
-                    </table>
-                </div>
-
-                <div style="background:white; padding:15px; border:1px solid #ccc; margin-bottom:20px;">
-                    <h3 style="margin-top:0; color:#333;">🔑 REGISTERED KEYS</h3>
-                    <table border="1" cellpadding="5" style="width:100%; border-collapse:collapse;">
-                        <tr style="background:#eee;"><th>Name</th><th>Key Code</th><th>Device Status</th><th>Expires</th><th>Actions</th></tr>
-                        {key_rows}
-                    </table>
-                </div>
-
-                <div style="background:#ffdddd; padding:15px; border:1px solid red;">
-                    <h3 style="margin-top:0; color:darkred;">🚫 BANNED KEYS</h3>
-                    <form method="POST" style="margin-bottom:10px;">
-                        <input type="text" name="ban_key" placeholder="Paste Key to ban..." style="width:300px; padding:5px;">
-                        <button style="padding:5px; cursor:pointer;">Manually Ban Key</button>
-                    </form>
-                    <table border="1" cellpadding="5" style="width:100%; background:white;">{ban_rows}</table>
-                </div>
-                <br><a href="/">Back to Dashboard</a> | <a href="/logout">Logout</a>
-            </div>
-            </body>"""
-
-@app.route('/')
+@app.route("/")
 @login_required
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML)
 
-# --- CLIENT DASHBOARD HTML ---
-HTML_TEMPLATE = """
+# ===================== NEW UI =====================
+HTML = """
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>TITAN V700 SOVEREIGN</title>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=JetBrains+Mono:wght@400;700&display=swap');
-        :root { --bg: #050505; --card: #111; --text: #fff; --accent: #00ff41; --loss: #ff0055; }
-        * { box-sizing: border-box; }
-        body { background-color: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; padding: 10px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
-        
-        .header { width: 100%; max-width: 480px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #222; }
-        .logo { font-family: 'JetBrains Mono'; font-weight: 900; letter-spacing: -1px; font-size: 20px; }
-        
-        .dashboard-grid { width: 100%; max-width: 480px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 15px; }
-        .stat-card { background: var(--card); padding: 12px; border-radius: 8px; text-align: center; border: 1px solid #222; }
-        .stat-label { font-size: 10px; color: #666; font-weight: bold; }
-        .stat-val { font-size: 16px; font-weight: 900; margin-top: 4px; font-family: 'JetBrains Mono'; }
-        
-        .main-card { width: 100%; max-width: 480px; background: var(--card); border-radius: 16px; padding: 20px; text-align: center; border: 1px solid #222; box-shadow: 0 0 40px rgba(0,0,0,0.5); margin-bottom: 20px; position: relative; overflow: hidden; }
-        
-        .timer-bar-bg { width: 100%; height: 4px; background: #222; position: absolute; top: 0; left: 0; }
-        .timer-bar { height: 100%; background: var(--accent); width: 100%; transition: width 1s linear; }
-        
-        .period-display { font-family: 'JetBrains Mono'; color: #555; font-size: 13px; margin-top: 10px; }
-        .prediction-display { font-size: 64px; font-weight: 900; text-transform: uppercase; margin: 15px 0; line-height: 1; letter-spacing: -2px; }
-        
-        .res-big { color: var(--accent); text-shadow: 0 0 30px rgba(0, 255, 65, 0.2); }
-        .res-small { color: var(--loss); text-shadow: 0 0 30px rgba(255, 0, 85, 0.2); }
-        .res-wait { color: #333; }
-        
-        .countdown { font-family: 'JetBrains Mono'; font-size: 28px; font-weight: bold; color: #fff; margin-bottom: 5px; }
-        
-        .reason-box { background: #0a0a0a; border: 1px solid #222; border-radius: 6px; padding: 8px; font-size: 10px; color: #888; font-family: 'JetBrains Mono'; margin-top: 15px; display: inline-block; width: 100%; }
-
-        .data-badge { font-size: 10px; color: #555; font-family: 'JetBrains Mono'; margin-top: 10px; border: 1px solid #333; padding: 4px; border-radius: 4px; display: inline-block; }
-
-        .history-list { width: 100%; max-width: 480px; background: var(--card); border-radius: 12px; border: 1px solid #222; overflow-y: auto; max-height: 300px; }
-        .history-item { display: flex; justify-content: space-between; padding: 10px 15px; border-bottom: 1px solid #1a1a1a; font-size: 12px; font-family: 'JetBrains Mono'; }
-        .h-win { color: var(--accent); } .h-loss { color: var(--loss); }
-    </style>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>TITAN V700</title>
+<style>
+body{background:#050505;color:#fff;font-family:Inter;margin:0}
+.card{background:#111;border:1px solid #222;border-radius:12px;padding:14px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.green{color:#00ff41}.red{color:#ff0055}.purple{color:#c77dff}
+</style>
 </head>
 <body>
-    <div class="header">
-        <div class="logo">TITAN <span style="color:var(--accent)">V700</span></div>
-        <a href="/logout" style="color:#444; text-decoration:none; font-size:12px;">EXIT</a>
-    </div>
+<div class=card>
+<b id=pred style="font-size:48px">---</b>
+<div id=level></div>
+<div id=timer></div>
+</div>
 
-    <div class="dashboard-grid">
-        <div class="stat-card"><div class="stat-label">SESSION WINS</div><div class="stat-val" style="color:var(--accent)" id="s-wins">0</div></div>
-        <div class="stat-card"><div class="stat-label">SESSION LOSS</div><div class="stat-val" style="color:var(--loss)" id="s-loss">0</div></div>
-        <div class="stat-card"><div class="stat-label">ACCURACY</div><div class="stat-val" id="s-acc">0%</div></div>
-    </div>
+<div class="card grid">
+<div>REAL W<br><b class=green id=rw>0</b></div>
+<div>REAL L<br><b class=red id=rl>0</b></div>
+<div>GHOST W<br><b class=purple id=gw>0</b></div>
+<div>GHOST L<br><b class=purple id=gl>0</b></div>
+</div>
 
-    <div class="main-card">
-        <div class="timer-bar-bg"><div class="timer-bar" id="t-bar"></div></div>
-        
-        <div class="period-display" id="period">PERIOD: ---</div>
-        
-        <div id="prediction" class="prediction-display res-wait">---</div>
-        
-        <div class="countdown" id="countdown">00</div>
-        <div style="font-size: 10px; color: #444;" id="status-text">SYNCING...</div>
+<div class=card id=hist></div>
 
-        <div class="reason-box">
-            LOGIC: <span id="reason-text" style="color:#ccc;">Waiting for data...</span>
-        </div>
-        
-        <div style="margin-top:10px;">
-             <div class="data-badge">
-                BRAIN CAPACITY: <span id="mem-count" style="color:var(--accent)">0</span> RECORDS
-            </div>
-        </div>
-    </div>
-
-    <div style="width:100%; max-width:480px; margin-bottom:5px; font-size:10px; color:#555; font-weight:bold; display:flex; justify-content:space-between;">
-        <span>RECENT OUTCOMES</span>
-        <span>LIVE FEED</span>
-    </div>
-    
-    <div class="history-list" id="history-box">
-        <div class="history-item" style="justify-content:center; color:#444;">No history available</div>
-    </div>
-
-    <script>
-        // HEARTBEAT to keep session alive
-        setInterval(() => { fetch('/heartbeat', {method: 'POST'}); }, 5000);
-
-        function update() {
-            fetch('/data').then(r => r.json()).then(d => {
-                // 1. Basic Info
-                document.getElementById('period').innerText = "PERIOD: " + (d.period || "---");
-                document.getElementById('status-text').innerText = d.status_text;
-                document.getElementById('s-wins').innerText = d.stats ? d.stats.wins : 0;
-                document.getElementById('s-loss').innerText = d.stats ? d.stats.losses : 0;
-                document.getElementById('s-acc').innerText = d.stats ? d.stats.accuracy : "0%";
-                
-                // 2. Memory Count
-                document.getElementById('mem-count').innerText = d.data_size || 0;
-
-                // 3. Prediction & Color
-                const p = document.getElementById('prediction');
-                p.innerText = d.prediction;
-                p.className = 'prediction-display';
-                if (d.prediction === 'BIG') p.classList.add('res-big');
-                else if (d.prediction === 'SMALL') p.classList.add('res-small');
-                else p.classList.add('res-wait');
-
-                // 4. Reasoning
-                document.getElementById('reason-text').innerText = d.reason || "Analyzing...";
-
-                // 5. Timer
-                const sec = d.timer || 0;
-                document.getElementById('countdown').innerText = sec < 10 ? "0"+sec : sec;
-                document.getElementById('t-bar').style.width = (sec/60 * 100) + "%";
-
-                // 6. History
-                if (d.history && d.history.length > 0) {
-                    let html = "";
-                    d.history.forEach(h => {
-                        let cls = h.result === 'WIN' ? 'h-win' : 'h-loss';
-                        html += `<div class="history-item">
-                            <span style="color:#666">${h.period}</span>
-                            <span style="font-weight:bold">${h.pred}</span>
-                            <span class="${cls}">${h.result}</span>
-                        </div>`;
-                    });
-                    document.getElementById('history-box').innerHTML = html;
-                }
-            }).catch(err => console.log(err));
-        }
-        setInterval(update, 1000); // Poll every second
-        update();
-    </script>
+<script>
+async function u(){
+ let d=await fetch('/data').then(r=>r.json())
+ document.getElementById('pred').innerText=d.prediction||'---'
+ document.getElementById('level').innerText=d.level||''
+ document.getElementById('timer').innerText=d.timer||''
+ let rw=0,rl=0,gw=0,gl=0,h=''
+ ;(d.history||[]).forEach(x=>{
+   if(x.level==='GHOST_SIM'){
+     x.result==='WIN'?gw++:gl++
+   }else{
+     x.result==='WIN'?rw++:rl++
+   }
+   h+=`<div>${x.period} ${x.pred} ${x.result} ${x.level}</div>`
+ })
+ rw&&(document.getElementById('rw').innerText=rw)
+ rl&&(document.getElementById('rl').innerText=rl)
+ gw&&(document.getElementById('gw').innerText=gw)
+ gl&&(document.getElementById('gl').innerText=gl)
+ document.getElementById('hist').innerHTML=h
+}
+setInterval(u,1000);u()
+</script>
 </body>
 </html>
 """
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+# ===================== RUN =====================
+if __name__ == "__main__":
+    app.run()
