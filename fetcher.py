@@ -1,5 +1,5 @@
 # ==============================================================================
-# MODULE: FETCHER.PY (V2026.38 - TITAN COMPLETE EDITION)
+# MODULE: FETCHER.PY (V2026.40 - FINAL GATED STRATEGY)
 # ==============================================================================
 
 import aiohttp
@@ -15,7 +15,7 @@ from datetime import datetime
 try:
     # UPDATED IMPORT: Added report_outcome_to_tracker for Dynamic Weighting
     from prediction_engine import ultraAIPredict, get_outcome_from_number, report_outcome_to_tracker
-    print("[INIT] TITAN V2026.38 LINKED.")
+    print("[INIT] TITAN V2026.40 LINKED (FULL GATED LOGIC).")
 except ImportError as e:
     print(f"\n[CRITICAL ERROR] prediction_engine.py not found: {e}")
     sys.exit()
@@ -85,7 +85,7 @@ async def load_db_to_ram():
         return len(RAM_HISTORY)
     except: return 0
 
-def update_dashboard(status_text="IDLE", timer_val=0):
+def update_dashboard(status_text="IDLE", timer_val=0, current_level=1):
     total = session_wins + session_losses
     acc = f"{(session_wins/total)*100:.1f}%" if total > 0 else "0.0%"
     
@@ -93,6 +93,7 @@ def update_dashboard(status_text="IDLE", timer_val=0):
         "period": last_prediction['issue'] if last_prediction['issue'] else "---",
         "prediction": last_prediction['label'],
         "level": last_prediction.get('level', '---'),
+        "current_bet_level": f"L{current_level}",
         "votes": last_prediction.get('raw_votes', {}),
         "lastresult_status": last_win_status,
         "status_text": status_text,
@@ -126,12 +127,14 @@ async def main_loop():
     ensure_db_setup()
     last_processed_issue = None
     
+    # === NEW: LEVEL TRACKER ===
+    current_bet_level = 1 
+    
     async with aiohttp.ClientSession() as session:
         print("\n" + "="*64)
-        print("   TITAN V2026.38 | FULL SPECTRUM ACTIVE")
-        print("   [!] Dynamic Weighting: ACTIVE (Engines Self-Learning)")
-        print("   [!] Ghost Breakthrough: ACTIVE (2 Wins Unlock)")
-        print("   [!] Reversal Hunter: ACTIVE (2 Losses + High Conf Unlock)")
+        print("   TITAN V2026.40 | CONFIDENCE-GATED STRATEGY ACTIVE")
+        print("   [!] L1: All Signals | L2: Leader/Titan | L3: Titan Only")
+        print("   [!] Stop Loss: 10 Min Cooldown after L3 Loss")
         print("="*64)
         
         # BOOT
@@ -163,7 +166,7 @@ async def main_loop():
                     if not any(d['issue'] == i_iss for d in RAM_HISTORY):
                         RAM_HISTORY.append({'issue': i_iss, 'actual_number': i_num})
 
-                update_dashboard(f"SYNC {cooldown_rounds_left}CD", 60 - current_second)
+                update_dashboard(f"SYNC {cooldown_rounds_left}CD", 60 - current_second, current_bet_level)
                 
                 if curr_issue != last_processed_issue:
                     
@@ -173,37 +176,56 @@ async def main_loop():
                         pred_label = last_prediction['label']
                         pred_level = last_prediction.get('level', '---')
                         
-                        # --- CRITICAL: FEEDBACK LOOP ---
-                        # Send result to prediction engine to update engine weights
+                        # --- FEEDBACK LOOP ---
                         report_outcome_to_tracker(last_prediction.get('raw_votes', {}), real_outcome)
 
                         # A. REAL BETS
-                        if pred_label not in ["WAITING", "SKIP", "COOLDOWN"] and pred_level != "GHOST_SIM":
+                        # NOTE: We now ignore "RISK_FILTER" skipped bets in the win/loss logic
+                        if pred_label not in ["WAITING", "SKIP", "COOLDOWN"] and pred_level != "GHOST_SIM" and pred_level != "RISK_FILTER":
                             consecutive_ghost_wins = 0 
                             consecutive_ghost_losses = 0
                             
                             if pred_label == real_outcome:
+                                # === WIN LOGIC ===
                                 session_wins += 1
                                 total_wins_accumulated += 1
                                 last_win_status = "WIN"
                                 current_momentum = min(current_momentum + 0.5, 2.0)
+                                
                                 print(f"\n[WIN] {curr_issue} | Result: {real_outcome} | Mom: {current_momentum:+.1f}")
+                                print(f"       >>> [LEVEL {current_bet_level}] CLEARED. RESET TO LEVEL 1. <<<")
+                                
+                                current_bet_level = 1  # <--- RESET LEVEL ON WIN
                                 
                                 if total_wins_accumulated >= COOLDOWN_TRIGGER:
                                     cooldown_rounds_left = COOLDOWN_DURATION
                                     total_wins_accumulated = 0
-                                    print(f"[SYSTEM] 5 Wins! Resting for {COOLDOWN_DURATION} rounds.")
+                                    print(f"[SYSTEM] 10 Wins! Resting for {COOLDOWN_DURATION} rounds.")
                             else:
+                                # === LOSS LOGIC ===
                                 session_losses += 1
-                                last_win_status = "LOSS"
                                 current_momentum = -1.0
                                 print(f"\n[LOSS] {curr_issue} | Result: {real_outcome} | Mom: {current_momentum:+.1f}")
+                                
+                                # === LEVEL CAP LOGIC (STOP LOSS SHIELD) ===
+                                if current_bet_level >= 3:
+                                    print(f"       [!!!] LEVEL 3 LOST. HARD STOP LOSS TRIGGERED.")
+                                    print(f"       [PROTECTION] Initiating 10-Round Safety Shield.")
+                                    
+                                    cooldown_rounds_left = 10  # Wait 10 rounds to shake off bad trend
+                                    current_bet_level = 1      # Reset level
+                                    last_win_status = "NONE"   # Reset status so we don't recover aggressively
+                                    current_momentum = -2.0    # Defensive momentum
+                                else:
+                                    current_bet_level += 1
+                                    last_win_status = "LOSS"
+                                    print(f"       >>> MOVING TO LEVEL {current_bet_level} <<<")
                             
                             UI_HISTORY.appendleft({
                                 "period": curr_issue, 
                                 "pred": pred_label, 
                                 "result": last_win_status, 
-                                "level": pred_level
+                                "level": f"{pred_level} (L{current_bet_level})"
                             })
                         
                         # B. GHOST BETS
@@ -249,6 +271,12 @@ async def main_loop():
                     if len(RAM_HISTORY) >= MIN_DATA_REQUIRED:
                         next_issue = str(int(curr_issue) + 1)
                         
+                        # === [SAFETY CLAMP] FORCE LEVEL LIMIT ===
+                        if current_bet_level > 3:
+                            print(f"[WARN] Level leaked to {current_bet_level}. Clamping to 3.")
+                            current_bet_level = 3
+                        # ========================================
+
                         if time_until_deadline > 10:
                             budget = time_until_deadline - 5
                             print(f"[PRED] Analyzing {next_issue}... (Budget: {budget}s)")
@@ -266,24 +294,63 @@ async def main_loop():
                                 
                                 final_decision = res['finalDecision']
                                 final_level = res['level']
-                                votes_str = " | ".join([f"{k}:{v}" for k,v in res['raw_votes'].items()])
-
-                                last_prediction = {
-                                    "issue": next_issue, 
-                                    "label": final_decision, 
-                                    "conf": res['confidence'], 
-                                    "level": final_level, 
-                                    "reason": res.get('reason', ''),
-                                    "raw_votes": res.get('raw_votes', {})
-                                }
                                 
-                                if final_level == "GHOST_SIM":
-                                    print(f"[GHOST] {final_decision} (Simulating...) | Score: {res['confidence']:.1f}")
-                                elif final_decision == "SKIP":
-                                    print(f"[SKIP] Low Confidence ({res['confidence']:.1f})")
+                                # === [NEW] CONFIDENCE-GATED BETTING LOGIC ===
+                                allowed_to_bet = False
+                                rejection_reason = ""
+
+                                if final_decision == "SKIP":
+                                    allowed_to_bet = False
+                                    rejection_reason = "Engine Skipped"
+                                elif final_level == "GHOST_SIM":
+                                    allowed_to_bet = False
+                                
+                                elif current_bet_level == 1:
+                                    # L1: Accepts SCOUT, LEADER, TITAN
+                                    if "L1" in final_level or "L2" in final_level or "L3" in final_level:
+                                        allowed_to_bet = True
+                                
+                                elif current_bet_level == 2:
+                                    # L2: Accepts LEADER, TITAN only
+                                    if "L2" in final_level or "L3" in final_level:
+                                        allowed_to_bet = True
+                                    else:
+                                        rejection_reason = f"L2 Risk requires LEADER/TITAN (Got {final_level})"
+                                
+                                elif current_bet_level == 3:
+                                    # L3: Accepts TITAN only
+                                    if "L3" in final_level:
+                                        allowed_to_bet = True
+                                    else:
+                                        rejection_reason = f"L3 Risk requires TITAN (Got {final_level})"
+
+                                # === EXECUTE FILTER ===
+                                if not allowed_to_bet and final_decision != "SKIP" and final_level != "GHOST_SIM":
+                                    print(f"[SMART SKIP] {rejection_reason} | Waiting for better signal...")
+                                    last_prediction = {
+                                        "issue": next_issue, 
+                                        "label": "SKIP", 
+                                        "level": "RISK_FILTER", 
+                                        "raw_votes": res.get('raw_votes', {})
+                                    }
                                 else:
-                                    print(f"[PRED] {final_decision} [{final_level}] Score:{res['confidence']:.1f}")
-                                    print(f"       Votes: {votes_str}")
+                                    votes_str = " | ".join([f"{k}:{v}" for k,v in res['raw_votes'].items()])
+                                    last_prediction = {
+                                        "issue": next_issue, 
+                                        "label": final_decision, 
+                                        "conf": res['confidence'], 
+                                        "level": final_level, 
+                                        "reason": res.get('reason', ''),
+                                        "raw_votes": res.get('raw_votes', {})
+                                    }
+                                    
+                                    if final_level == "GHOST_SIM":
+                                        print(f"[GHOST] {final_decision} (Simulating...) | Score: {res['confidence']:.1f}")
+                                    elif allowed_to_bet:
+                                        print(f"[PRED] {final_decision} [{final_level}] Score:{res['confidence']:.1f}")
+                                        print(f"       Votes: {votes_str}")
+                                    else:
+                                        print(f"[SKIP] {res.get('reason', 'Low Confidence')} ({res['confidence']:.1f})")
                                 
                             except Exception as e: 
                                 print(f"[ERROR] {e}")
