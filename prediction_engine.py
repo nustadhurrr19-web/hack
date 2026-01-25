@@ -1,5 +1,5 @@
 # ==============================================================================
-# MODULE: PREDICTION_ENGINE.PY (V2026.38 - DYNAMIC WEIGHTING)
+# MODULE: PREDICTION_ENGINE.PY (V2026.42 - TITAN NEURAL EMULATOR)
 # ==============================================================================
 import math
 import statistics
@@ -9,7 +9,7 @@ import json
 import warnings
 import time
 import random
-from collections import defaultdict, Counter
+from collections import defaultdict, deque
 from typing import Dict, List, Optional, Any
 
 warnings.filterwarnings("ignore")
@@ -149,7 +149,7 @@ def engine_markov_matrix(history):
     return None
 
 # =============================================================================
-# 3. PERFORMANCE TRACKER (NEW: DYNAMIC WEIGHTING)
+# 3. PERFORMANCE TRACKER (DYNAMIC WEIGHTING)
 # =============================================================================
 
 class EnginePerformanceTracker:
@@ -187,12 +187,11 @@ class EnginePerformanceTracker:
         if win_rate <= 0.3: return base * 0.5
         return base
 
-# We need deque for the tracker
-from collections import deque
+# Initialize global tracker
 performance_tracker = EnginePerformanceTracker()
 
 # =============================================================================
-# 4. DEEP BRAIN
+# 4. DEEP BRAIN (NOW WITH NEURAL EMULATOR)
 # =============================================================================
 
 class TitanDeepBrain:
@@ -204,17 +203,26 @@ class TitanDeepBrain:
         self.perspectives = ["Analyze sequence.", "Analyze volatility.", "Intuition."]
 
     def train_ensemble(self, history, current_round_id):
+        # Retrain every 15 rounds
         if self.models_ready and (current_round_id - self.last_train_round < 15): return
-        if not pd or len(history) < 60: return
+        
+        # [STRATEGY UPDATE] Use last 300 rounds only (Keeps logic fresh)
+        training_subset = history[-300:] if len(history) > 300 else history
+        
+        if not pd or len(training_subset) < 60: return
         try:
-            df = pd.DataFrame(history)
+            df = pd.DataFrame(training_subset)
             df['num'] = df['actual_number'].astype(int)
             df['label'] = df['num'].apply(lambda x: 1 if x >= 5 else 0)
-            df['rmean'] = df['num'].rolling(8).mean()
-            df['std'] = df['num'].rolling(8).std()
+            
+            # Use Rolling(6) for 300 rounds (better responsiveness than 8)
+            df['rmean'] = df['num'].rolling(6).mean()
+            df['std'] = df['num'].rolling(6).std()
+            
             df = df.fillna(0)
             df['target'] = df['label'].shift(-1)
             train_df = df.dropna()
+            
             X = train_df[['rmean', 'std', 'num']]
             y = train_df['target']
             X_s = self.scaler.fit_transform(X)
@@ -227,21 +235,76 @@ class TitanDeepBrain:
             self.last_train_round = current_round_id
         except: pass
 
+    def _mimic_intuition(self, history):
+        """
+        FALLBACK: Simulates AI thinking using statistical heuristics.
+        Called when Ollama is offline to ensure 'Titan Consensus' still works.
+        """
+        try:
+            if len(history) < 20: return None, 0.0
+            
+            # 1. Volatility Check (Chaos Theory)
+            val_nums = [int(safe_float(d['actual_number'])) for d in history[-12:]]
+            std_dev = statistics.stdev(val_nums) if len(val_nums) > 1 else 0
+            
+            # 2. Pattern Momentum (Trend Logic)
+            last_6 = [get_outcome(d['actual_number']) for d in history[-6:]]
+            b_count = last_6.count("BIG")
+            
+            # MIMIC LOGIC:
+            vote = None
+            if std_dev > 2.8: 
+                # High Chaos -> Reversal Probability High
+                if last_6[-1] == "BIG": vote = "SMALL"
+                else: vote = "BIG"
+            elif std_dev < 1.5: 
+                # Low Chaos -> Trend Follow Probability High
+                if b_count > 3: vote = "BIG"
+                else: vote = "SMALL"
+            else:
+                # Balanced -> Use Pattern Balance
+                if b_count > 3: vote = "SMALL" # Revert to mean
+                else: vote = "BIG"
+
+            return vote, 0.70 # Synthetic confidence
+        except:
+            return None, 0.0
+
     async def forced_contemplation_loop(self, history, time_budget):
         start_time = time.time()
         votes = []
         nums = [d['actual_number'] for d in history[-20:]]
-        for task in self.perspectives:
-            if time.time() > start_time + (time_budget - 2): break
-            try:
-                async with aiohttp.ClientSession() as s:
-                    async with s.post(OLLAMA_URL, json={"model":OLLAMA_MODEL, "prompt":f"Data:{nums} Task:{task} JSON:{{'prediction':'BIG'/'SMALL'}}", "stream":False, "format":"json"}, timeout=8) as r:
-                        if r.status==200:
-                            js = await r.json()
-                            pred = json.loads(js['response']).get('prediction')
-                            if pred: votes.append(pred.upper())
-            except: pass
-        if not votes: return None, 0.0
+        
+        # 1. TRY REAL OLLAMA
+        ollama_alive = False
+        try:
+            # Quick check if port is open/responding before loop
+            async with aiohttp.ClientSession() as s:
+                async with s.get("http://localhost:11434/", timeout=1) as r:
+                    if r.status == 200: ollama_alive = True
+        except: 
+            ollama_alive = False
+
+        if ollama_alive:
+            for task in self.perspectives:
+                if time.time() > start_time + (time_budget - 2): break
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        async with s.post(OLLAMA_URL, json={"model":OLLAMA_MODEL, "prompt":f"Data:{nums} Task:{task} JSON:{{'prediction':'BIG'/'SMALL'}}", "stream":False, "format":"json"}, timeout=8) as r:
+                            if r.status==200:
+                                js = await r.json()
+                                pred = json.loads(js['response']).get('prediction')
+                                if pred: votes.append(pred.upper())
+                except: pass
+        
+        # 2. FALLBACK: USE MIMIC IF OLLAMA FAILED
+        if not votes:
+            # print("   [INFO] Ollama silent. Engaging Neural Emulator.") # Optional Log
+            mimic_vote, mimic_conf = self._mimic_intuition(history)
+            if mimic_vote: 
+                return mimic_vote, mimic_conf
+            return None, 0.0
+
         big = votes.count("BIG"); small = votes.count("SMALL")
         if big > small: return "BIG", big/(big+small)
         elif small > big: return "SMALL", small/(big+small)
@@ -250,15 +313,12 @@ class TitanDeepBrain:
 brain = TitanDeepBrain()
 
 # =============================================================================
-# 5. MAIN CONTROLLER (DYNAMIC WEIGHTING V2026.38)
+# 5. MAIN CONTROLLER (TITAN V2026.42 - EMULATOR INTEGRATED)
 # =============================================================================
 
 async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_status="WIN", current_momentum=0.0, ghost_wins_streak=0, ghost_loss_streak=0, time_budget: int = 30) -> Dict:
     
-    # 0. UPDATE PERFORMANCE TRACKER (Crucial Step)
-    # We need to feed the LAST result into the tracker to update weights for THIS round
-    # Note: Ideally this is done in fetcher, but we can't easily access the tracker there without global mess.
-    # For now, we assume the weights adjust over time naturally or we add a helper function.
+    # 0. UPDATE PERFORMANCE TRACKER (Done via report_outcome_to_tracker)
     
     try:
         last_num = int(history[-1]['actual_number'])
@@ -274,7 +334,7 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     # --- B. BACKGROUND TRAINING ---
     await asyncio.to_thread(brain.train_ensemble, history, int(history[-1]['issue']))
 
-    # --- C. OLLAMA ---
+    # --- C. OLLAMA (OR EMULATOR) ---
     ollama_pred = None; ollama_conf = 0.0
     try: ollama_pred, ollama_conf = await brain.forced_contemplation_loop(history, time_budget)
     except: pass
@@ -285,7 +345,7 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     if brain.models_ready and pd and brain.m3:
         try:
             df = pd.DataFrame(history); df['num'] = df['actual_number'].astype(int)
-            df['rmean'] = df['num'].rolling(10).mean(); df['std'] = df['num'].rolling(10).std()
+            df['rmean'] = df['num'].rolling(6).mean(); df['std'] = df['num'].rolling(6).std()
             df = df.fillna(0); last = df.iloc[[-1]][['rmean', 'std', 'num']]
             p3 = brain.m3.predict_proba(last)[0][1]
             if p3 > 0.51: raw_signals['XGB'] = {'pred': "BIG", 'conf': p3} 
@@ -295,7 +355,7 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     if brain.models_ready and pd:
          try:
             df = pd.DataFrame(history); df['num'] = df['actual_number'].astype(int)
-            df['rmean'] = df['num'].rolling(10).mean(); df['std'] = df['num'].rolling(10).std()
+            df['rmean'] = df['num'].rolling(6).mean(); df['std'] = df['num'].rolling(6).std()
             df = df.fillna(0); last = df.iloc[[-1]][['rmean', 'std', 'num']]
             p1 = brain.m1.predict_proba(brain.scaler.transform(last))[0][1]
             p2 = brain.m2.predict_proba(last)[0][1]
@@ -315,13 +375,22 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     vote_display = {}
 
     for name, sig in raw_signals.items():
-        # GET DYNAMIC WEIGHT INSTEAD OF STATIC
+        # GET DYNAMIC WEIGHT
         points = performance_tracker.get_dynamic_weight(name)
-        
         vote_display[name] = f"{sig['pred']} (w={points:.1f})"
         
         if sig['pred'] == "BIG": big_points += points
         else: small_points += points
+    
+    # --- [CONFLICT VETO] ---
+    # If XGB and Pattern disagree, force SKIP
+    xgb_sig = raw_signals.get('XGB', {}).get('pred')
+    pat_sig = raw_signals.get('PATTERN', {}).get('pred')
+    if xgb_sig and pat_sig and xgb_sig != pat_sig:
+        # Check if both are relatively confident
+        if raw_signals['XGB']['conf'] > 0.6 and raw_signals['PATTERN']['conf'] > 0.15:
+            return {'finalDecision': "SKIP", 'confidence': 0, 'level': "SKIP", 'reason': "Conflict Veto", 'raw_votes': vote_display}
+    # ---------------------------
 
     if big_points > small_points:
         final_decision = "BIG"
@@ -341,14 +410,34 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     if current_momentum != 0: net_score += current_momentum
     if ghost_wins_streak >= 2: net_score += 0.5
     
-    # --- G. DECISION LOGIC ---
+    # --- G. DECISION LOGIC (TITAN CONSENSUS & OVERRIDE) ---
     REAL_THRESHOLD = 1.25; GHOST_THRESHOLD = 0.5; RECOVERY_THRESHOLD = 2.0
     if last_win_status == "LOSS": REAL_THRESHOLD = RECOVERY_THRESHOLD; vote_display['MODE'] = "RECOVERY"
     
     is_volatile = vol_score > 0.48
     hot_hand_unlock = (ghost_wins_streak >= 2)
     reversal_unlock = (ghost_loss_streak >= 2 and net_score >= 4.5)
-    titan_override = (net_score >= 4.5)
+    
+    # [FIX] Do we have Consensus? (OLLAMA now backed by Emulator)
+    ml_vote = raw_signals.get('ML', {}).get('pred')
+    ollama_vote = raw_signals.get('OLLAMA', {}).get('pred')
+    pat_vote = raw_signals.get('PATTERN', {}).get('pred')
+
+    titan_consensus = False
+    
+    # Priority 1: AI Sync (Works with Real Ollama OR Emulator)
+    if ml_vote and ollama_vote and ml_vote == ollama_vote:
+        titan_consensus = True
+    # Priority 2: Fallback Sync (ML + PATTERN) if even Emulator is unsure
+    elif ml_vote and pat_vote and ml_vote == pat_vote:
+        titan_consensus = True 
+
+    if titan_consensus and ml_vote == final_decision:
+        net_score += 1.0 # Bonus for AI agreement
+        vote_display['AI_SYNC'] = "+1.0"
+
+    # Override: If score is massive (>= 5.0), we force TITAN logic
+    titan_override = (net_score >= 5.0)
     
     can_bypass_volatility = hot_hand_unlock or reversal_unlock or titan_override
 
@@ -357,7 +446,15 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
     elif net_score >= REAL_THRESHOLD:
         level = "L1_SCOUT"
         if net_score >= 3.0: level = "L2_LEADER"
-        if net_score >= 4.5: level = "L3_TITAN"
+        
+        # [TITAN LOGIC]
+        if net_score >= 4.2:
+            if titan_consensus or titan_override:
+                level = "L3_TITAN"
+            else:
+                level = "L2_LEADER"
+                vote_display['TITAN_DENIED'] = "NO_SYNC"
+                
     elif net_score >= GHOST_THRESHOLD and not is_trap_number and not is_chopping:
         level = "GHOST_SIM"
     else:
@@ -374,7 +471,6 @@ async def ultraAIPredict(history: List[Dict], current_bankroll: float, last_win_
 # Helper to allow fetcher to update tracker
 def report_outcome_to_tracker(raw_votes, actual_outcome):
     # raw_votes format: {'XGB': 'BIG (w=1.5)', ...}
-    # We need to parse this back to simple predictions
     parsed_votes = {}
     for k, v in raw_votes.items():
         if "BIG" in v: parsed_votes[k] = "BIG"
