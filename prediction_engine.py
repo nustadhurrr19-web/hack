@@ -1,282 +1,221 @@
-
+# ==============================================================================
+# MODULE: PREDICTION_ENGINE.PY (V2026.100 - SNIPER EDITION)
+# ==============================================================================
 import statistics
+import random
 import warnings
+import math
 import numpy as np
-from typing import Dict, List, Optional
+from collections import Counter
 
 warnings.filterwarnings("ignore")
 
-# --- ML IMPORTS (FAIL-SAFE) ---
+# --- ML IMPORTS ---
 try:
     import pandas as pd
     from sklearn.ensemble import RandomForestClassifier
-    import xgboost as xgb
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    print("[WARN] ML libraries (pandas/sklearn/xgboost) not found. Running in Pattern-Only mode.")
+    print("[WARN] ML libraries missing. Running in 'Pattern+Math' mode.")
 
-# --- HELPER FUNCTIONS ---
+# --- UTILS ---
 def get_outcome(n):
+    """Converts number to BIG/SMALL outcome."""
     try:
         val = int(float(n))
-        if 0 <= val <= 4: return "SMALL"
-        if 5 <= val <= 9: return "BIG"
-    except: pass
-    return "UNKNOWN"
+        return "SMALL" if 0 <= val <= 4 else "BIG"
+    except: return "UNKNOWN"
 
 # =============================================================================
-# 1. MATHEMATICAL SAFETY GUARDS (THE SHIELD)
+# PHASE 1: THE FOUNDATION (HURST EXPONENT)
 # =============================================================================
-
-def math_trap_detector(history, window=12):
-    """
-    Detects 'Chopping' (Zig-Zag) markets.
-    Returns: (is_trapped: bool, chop_intensity: float)
-    """
+def calculate_hurst(history, max_lag=20):
     try:
-        if len(history) < window: return False, 0.0
-        outcomes = [get_outcome(d['actual_number']) for d in history[-window:]]
+        # [SNIPER TWEAK] Fast-start with default TREND assumption if low data
+        if len(history) < 10: return 0.6 
         
-        # Count how many times the result flips (Big->Small or Small->Big)
-        flips = sum(1 for i in range(len(outcomes)-1) if outcomes[i] != outcomes[i+1])
-        chop_score = flips / (window - 1)
+        data = [float(d['actual_number']) for d in history]
+        available_lag = min(max_lag, len(data) // 2)
+        if available_lag < 2: return 0.6
         
-        # If > 60% of the last 12 rounds were flips, it's a trap.
-        return (chop_score > 0.60), chop_score
-    except: return False, 0.0
-
-def math_streak_detector(history):
-    """
-    Detects strong streaks (e.g., 5 BIGs in a row).
-    Returns: (streak_count: int, streak_type: str)
-    """
-    try:
-        if not history: return 0, "NONE"
-        outcomes = [get_outcome(d['actual_number']) for d in history[-15:]]
-        if not outcomes: return 0, "NONE"
+        lags = range(2, available_lag)
+        tau = [np.sqrt(np.std(np.subtract(data[lag:], data[:-lag]))) for lag in lags]
         
-        current_type = outcomes[-1]
-        count = 1
-        for i in range(len(outcomes)-2, -1, -1):
-            if outcomes[i] == current_type: count += 1
-            else: break
-        return count, current_type
-    except: return 0, "NONE"
+        y = np.log(tau)
+        x = np.log(lags)
+        H = np.polyfit(x, y, 1)[0]
+        return H
+    except: return 0.6
 
 # =============================================================================
-# 2. PATTERN ENGINE (THE EYES)
+# PHASE 2: THE 3 ENGINES (THE VOTERS)
 # =============================================================================
 
-def engine_pattern_v3(history):
-    """
-    Scans for repeating sequences (e.g., B S B S -> B).
-    """
+# --- ENGINE 1: FRACTAL (Pattern) ---
+def engine_fractal(history):
     try:
-        if len(history) < 60: return None
-        # Convert history to string: "BBSB..."
+        if len(history) < 10: return None
         outcomes = "".join(["B" if get_outcome(d['actual_number']) == "BIG" else "S" for d in history])
         
-        best_conf = 0.0
-        best_pred = None
+        pattern = outcomes[-4:] # Short pattern for speed
+        search_space = outcomes[:-1]
         
-        # Look for patterns of length 4, 5, and 6
-        for depth in [4, 5, 6]: 
-            current_pattern = outcomes[-depth:]
-            # Search entire history for this pattern
-            search_space = outcomes[:-1]
-            found_count = search_space.count(current_pattern)
+        found_count = search_space.count(pattern)
+        if found_count < 2: return None
+        
+        next_b = 0
+        start_idx = 0
+        while True:
+            idx = search_space.find(pattern, start_idx)
+            if idx == -1: break
+            if idx + 4 < len(search_space):
+                if search_space[idx+4] == 'B': next_b += 1
+            start_idx = idx + 1
             
-            if found_count < 3: continue # Not enough data
-            
-            # Find what happened AFTER this pattern previously
-            next_b = 0
-            start_index = 0
-            while True:
-                idx = search_space.find(current_pattern, start_index)
-                if idx == -1: break
-                # Check the character immediately following the pattern
-                if idx + depth < len(search_space):
-                    if search_space[idx+depth] == 'B': next_b += 1
-                start_index = idx + 1
-            
-            prob_b = next_b / found_count
-            
-            # Calculate deviation from 50/50
-            diff = abs(prob_b - 0.5)
-            
-            if diff > best_conf:
-                best_conf = diff
-                best_pred = "BIG" if prob_b > 0.5 else "SMALL"
-
-        # Only return if we found a significant pattern (>15% edge)
-        if best_conf > 0.15:
-            # Normalize confidence to 0-1 scale approx
-            final_conf = 0.5 + best_conf 
-            return {'pred': best_pred, 'conf': final_conf}
-            
-    except Exception: pass
+        prob_big = next_b / found_count
+        
+        # [SNIPER TWEAK] Stricter pattern requirements
+        if prob_big > 0.65: return {"vote": "BIG", "conf": prob_big}
+        if prob_big < 0.35: return {"vote": "SMALL", "conf": 1.0 - prob_big}
+    except: pass
     return None
 
-# =============================================================================
-# 3. MACHINE LEARNING ENGINE (THE BRAIN)
-# =============================================================================
+# --- ENGINE 2: MOMENTUM (Physics) ---
+def engine_momentum(history, market_phase="NEUTRAL"):
+    try:
+        if len(history) < 10: return None
+        outcomes = [get_outcome(d['actual_number']) for d in history[-20:]]
+        
+        last_val = outcomes[-1]
+        streak = 1
+        for i in range(len(outcomes)-2, -1, -1):
+            if outcomes[i] == last_val: streak += 1
+            else: break
+            
+        if market_phase == "TREND":
+            if streak >= 3: return {"vote": last_val, "conf": 0.75} # Strong Trend
+        elif market_phase == "CHOP":
+            if streak >= 2: return {"vote": "BIG" if last_val=="SMALL" else "SMALL", "conf": 0.65} # Fade
+            
+        recent = outcomes[-12:]
+        big_count = recent.count("BIG")
+        if big_count >= 8: return {"vote": "BIG", "conf": 0.70}
+        if big_count <= 4: return {"vote": "SMALL", "conf": 0.70}
+    except: pass
+    return None
 
-class SniperML:
+# --- ENGINE 3: SMART ML (The Brain) ---
+class SmartML:
     def __init__(self):
-        self.model_xgb = None
-        self.model_rf = None
+        self.model = None
         self.is_trained = False
         self.last_train_size = 0
 
     def train(self, history):
-        """
-        Trains the models ONCE. Called by fetcher at startup.
-        """
-        if not ML_AVAILABLE or len(history) < 100: return
-        if self.is_trained and len(history) - self.last_train_size < 500: return # Don't over-train
+        if not ML_AVAILABLE or len(history) < 30: return
+        if self.is_trained and len(history) - self.last_train_size < 50: return
 
         try:
             df = pd.DataFrame(history)
             df['val'] = df['actual_number'].astype(int)
-            
-            # Feature Engineering
-            df['target'] = df['val'].apply(lambda x: 1 if x >= 5 else 0).shift(-1) # 1=BIG, 0=SMALL
-            
-            # Rolling features (Trends)
-            for window in [3, 6, 12]:
-                df[f'mean_{window}'] = df['val'].rolling(window).mean()
-                df[f'std_{window}'] = df['val'].rolling(window).std()
-            
+            df['target'] = df['val'].apply(lambda x: 1 if x >= 5 else 0).shift(-1)
+            df['ma_5'] = df['val'].rolling(5).mean()
+            df['ma_10'] = df['val'].rolling(10).mean()
             df = df.dropna()
             
-            features = [c for c in df.columns if 'mean' in c or 'std' in c]
-            X = df[features]
+            X = df[['ma_5', 'ma_10']]
             y = df['target']
             
-            # Train XGBoost (Fast & Accurate)
-            self.model_xgb = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, eval_metric='logloss')
-            self.model_xgb.fit(X, y)
-            
-            # Train Random Forest (Robustness)
-            self.model_rf = RandomForestClassifier(n_estimators=100, max_depth=5)
-            self.model_rf.fit(X, y)
-            
+            self.model = RandomForestClassifier(n_estimators=50, max_depth=5)
+            self.model.fit(X, y)
             self.is_trained = True
             self.last_train_size = len(history)
-            print(f"[SNIPER ML] Training Complete. (Samples: {len(X)})")
-            
-        except Exception as e:
-            print(f"[SNIPER ML] Training Failed: {e}")
+        except: pass
 
     def predict(self, history):
         if not self.is_trained: return None
         try:
-            # Prepare single row for prediction
-            last_idx = len(history)
-            # We need enough history to calculate the rolling windows
-            subset = history[-20:] 
+            subset = history[-15:]
             df = pd.DataFrame(subset)
             df['val'] = df['actual_number'].astype(int)
+            ma5 = df['val'].rolling(5).mean().iloc[-1]
+            ma10 = df['val'].rolling(10).mean().iloc[-1]
             
-            # Recreate features exactly as in training
-            row = {}
-            for window in [3, 6, 12]:
-                row[f'mean_{window}'] = df['val'].rolling(window).mean().iloc[-1]
-                row[f'std_{window}'] = df['val'].rolling(window).std().iloc[-1]
+            prob_big = self.model.predict_proba([[ma5, ma10]])[0][1]
+            vote = "BIG" if prob_big > 0.5 else "SMALL"
+            conf = prob_big if vote == "BIG" else 1 - prob_big
             
-            X_pred = pd.DataFrame([row])
-            
-            # Get probabilities
-            p_xgb = self.model_xgb.predict_proba(X_pred)[0][1] # Prob of 1 (BIG)
-            p_rf = self.model_rf.predict_proba(X_pred)[0][1]
-            
-            avg_prob = (p_xgb + p_rf) / 2
-            
-            decision = "BIG" if avg_prob > 0.5 else "SMALL"
-            confidence = avg_prob if decision == "BIG" else 1 - avg_prob
-            
-            return {'pred': decision, 'conf': confidence}
-        except: return None
+            # [SNIPER TWEAK] Higher ML confidence needed
+            if conf > 0.55: return {"vote": vote, "conf": conf}
+        except: pass
+        return None
 
-# Initialize Global Brain
-brain = SniperML()
+brain = SmartML()
 
 # =============================================================================
-# 4. MAIN SNIPER LOGIC
+# PHASE 3: CONSENSUS FILTER (THE SNIPER)
 # =============================================================================
-
-def get_sniper_prediction(history: List[Dict]) -> Dict:
-    """
-    The Single Source of Truth.
-    Returns: {'decision': 'BIG'/'SMALL'/'SKIP', 'reason': str}
-    """
+def get_tricore_prediction(history):
     
-    # 0. TRAIN IF NEEDED (First run only usually)
+    hurst = calculate_hurst(history)
+    
+    market_phase = "NEUTRAL"
+    if hurst > 0.6: market_phase = "TREND"
+    elif hurst < 0.4: market_phase = "CHOP"
+    
+    # [SNIPER TWEAK] Strict Chaos Filter
+    if 0.48 < hurst < 0.52:
+        return {
+            "decision": "SKIP", 
+            "reason": f"CHAOS (H={hurst:.2f})",
+            "details": {"fractal": "-", "momentum": "-", "ml": "-"}
+        }
+
     brain.train(history)
+    votes = []
+    engine_details = {"fractal": "-", "momentum": "-", "ml": "-"}
     
-    # 1. SAFETY CHECKS (The Veto)
-    is_chopping, chop_score = math_trap_detector(history)
-    if is_chopping:
-        return {'decision': 'SKIP', 'reason': f"MARKET CHOP ({chop_score:.2f})"}
-
-    streak_len, streak_type = math_streak_detector(history)
+    v1 = engine_fractal(history)
+    if v1: 
+        votes.append(v1)
+        engine_details['fractal'] = f"{v1['vote']} ({int(v1['conf']*100)}%)"
+        
+    v2 = engine_momentum(history, market_phase)
+    if v2: 
+        votes.append(v2)
+        engine_details['momentum'] = f"{v2['vote']} ({int(v2['conf']*100)}%)"
+        
+    v3 = brain.predict(history)
+    if v3: 
+        votes.append(v3)
+        engine_details['ml'] = f"{v3['vote']} ({int(v3['conf']*100)}%)"
     
-    # 2. GATHER SIGNALS
-    signals = []
+    if not votes:
+        return {"decision": "SKIP", "reason": "SILENCE", "details": engine_details}
+        
+    big_votes = sum(1 for v in votes if v['vote'] == "BIG")
+    small_votes = sum(1 for v in votes if v['vote'] == "SMALL")
     
-    # A. ML Signal
-    ml_res = brain.predict(history)
-    if ml_res and ml_res['conf'] > 0.53: # Min confidence threshold
-        signals.append(ml_res)
+    final_decision = "SKIP"
+    reason = "CONFLICT"
     
-    # B. Pattern Signal
-    pat_res = engine_pattern_v3(history)
-    if pat_res:
-        signals.append(pat_res)
-
-    # 3. CONSENSUS LOGIC
-    if not signals:
-        return {'decision': 'SKIP', 'reason': "NO SIGNAL"}
-
-    final_pred = None
-    
-    # CASE 1: ML + PATTERN Agreement (Strongest)
-    if ml_res and pat_res:
-        if ml_res['pred'] == pat_res['pred']:
-            final_pred = ml_res['pred']
-            reason = f"SNIPER LOCK (ML:{ml_res['conf']:.2f} + PAT)"
-        else:
-            # Conflict -> Check if one is overwhelming
-            if ml_res['conf'] > 0.70: 
-                final_pred = ml_res['pred']
-                reason = "ML OVERRIDE"
-            elif pat_res['conf'] > 0.75:
-                final_pred = pat_res['pred']
-                reason = "PATTERN OVERRIDE"
-            else:
-                return {'decision': 'SKIP', 'reason': "CONFLICT"}
-    
-    # CASE 2: Single Signal (Must be high confidence)
-    elif ml_res:
-        if ml_res['conf'] > 0.60:
-            final_pred = ml_res['pred']
-            reason = f"ML SOLO ({ml_res['conf']:.2f})"
-        else:
-            return {'decision': 'SKIP', 'reason': "WEAK ML"}
+    # [SNIPER TWEAK] Strict Voting Logic
+    if big_votes >= 2:
+        final_decision = "BIG"
+        reason = f"SNIPER ({big_votes}/3)"
+    elif small_votes >= 2:
+        final_decision = "SMALL"
+        reason = f"SNIPER ({small_votes}/3)"
+    elif len(votes) == 1:
+        solo = votes[0]
+        # Only accept Solo bets if SUPER High Confidence
+        if solo['conf'] > 0.75:
+            final_decision = solo['vote']
+            reason = f"GOLDEN SOLO ({int(solo['conf']*100)}%)"
             
-    elif pat_res:
-        if pat_res['conf'] > 0.65:
-            final_pred = pat_res['pred']
-            reason = "PATTERN SOLO"
-        else:
-            return {'decision': 'SKIP', 'reason': "WEAK PATTERN"}
-
-    # 4. STREAK PROTECTION
-    # If we are betting AGAINST a huge streak (e.g. 5 BIGs and we bet SMALL), be careful
-    if streak_len >= 5 and streak_type != final_pred:
-        # Only fight a streak if we have massive confidence
-        if "SNIPER LOCK" not in reason:
-            return {'decision': 'SKIP', 'reason': f"RESPECT STREAK ({streak_type} {streak_len})"}
-
-    return {'decision': final_pred, 'reason': reason}
+    return {
+        "decision": final_decision,
+        "reason": reason,
+        "details": engine_details
+    }
