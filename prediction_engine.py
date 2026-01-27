@@ -1,6 +1,4 @@
-# ==============================================================================
-# MODULE: PREDICTION_ENGINE.PY (V2026.50 - TITAN SNIPER LITE)
-# ==============================================================================
+
 import statistics
 import warnings
 import numpy as np
